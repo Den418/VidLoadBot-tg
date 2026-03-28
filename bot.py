@@ -11,6 +11,8 @@ from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.enums import ParseMode
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
 from pyrogram import Client
 
 # ================= НАСТРОЙКИ =================
@@ -35,11 +37,13 @@ PRICES_STARS = {
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
 
-bot = Bot(token=BOT_TOKEN)
+# ✅ Увеличенный таймаут для aiogram — чтобы не падал при отправке больших файлов
+_session = AiohttpSession(timeout=ClientTimeout(total=3600))
+bot = Bot(token=BOT_TOKEN, session=_session)
 dp = Dispatcher()
 router = Router()
 
-# ФИКС: Pyrogram запускается один раз в main()
+# ✅ Pyrogram запускается один раз в main()
 pyro_app = Client("pyro_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
@@ -91,7 +95,7 @@ def build_progress_bar(percent_str: str) -> str:
 async def update_progress_message(msg: Message, task_id: int):
     last_text = ""
     while task_id in progress_data:
-        data  = progress_data[task_id]
+        data  = progress_data.get(task_id, {})
         phase = data.get('phase', 'download')
         bar   = build_progress_bar(data.get('percent', '0%'))
 
@@ -153,18 +157,15 @@ async def init_db():
                 last_reset      INTEGER DEFAULT 0
             )
         ''')
-        # ФИКС: миграция — добавляем колонку если БД уже существовала без неё
         try:
             await db.execute("ALTER TABLE users ADD COLUMN total_downloads INTEGER DEFAULT 0")
         except Exception:
-            pass  # колонка уже есть
+            pass
 
         await db.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
         await db.execute('''CREATE TABLE IF NOT EXISTS promo_codes (code TEXT PRIMARY KEY, discount_percent INTEGER)''')
-
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('requisites', 'Карта: 0000')")
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('daily_limit', '3')")
-        # Водяной знак на видео — по умолчанию ВЫКЛЮЧЕН
         await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('watermark_enabled', '0')")
         await db.commit()
 
@@ -267,22 +268,22 @@ async def get_admin_panel_keyboard() -> InlineKeyboardMarkup:
     wm_emoji = "6037496202990194718" if wm else "6037249452824072506"
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="Статистика",        callback_data="admin_stats",
+            InlineKeyboardButton(text="Статистика",         callback_data="admin_stats",
                                  icon_custom_emoji_id="5870921681735781843"),
-            InlineKeyboardButton(text="Рассылка",          callback_data="admin_broadcast",
+            InlineKeyboardButton(text="Рассылка",           callback_data="admin_broadcast",
                                  icon_custom_emoji_id="6039422865189638057"),
         ],
         [
-            InlineKeyboardButton(text="Лимит скачиваний",  callback_data="admin_limit",
+            InlineKeyboardButton(text="Лимит скачиваний",   callback_data="admin_limit",
                                  icon_custom_emoji_id="5775896410780079073"),
-            InlineKeyboardButton(text="Промокоды",         callback_data="admin_promo",
+            InlineKeyboardButton(text="Промокоды",          callback_data="admin_promo",
                                  icon_custom_emoji_id="5886285355279193209"),
         ],
         [
             InlineKeyboardButton(text=f"Водяной знак: {wm_label}", callback_data="admin_toggle_watermark",
                                  icon_custom_emoji_id=wm_emoji),
         ],
-        [InlineKeyboardButton(text="Назад",                callback_data="back_to_main")],
+        [InlineKeyboardButton(text="Назад",                 callback_data="back_to_main")],
     ])
 
 
@@ -366,7 +367,8 @@ async def help_handler(message: Message):
         f'/start — главное меню\n'
         f'/help — эта справка\n'
         f'/mystats — твоя статистика\n\n'
-        f'<i><tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Если что-то не скачивается — возможно, ссылка закрытая или сайт временно недоступен.</i>'
+        f'<i><tg-emoji emoji-id="6028435952299413210">ℹ</tg-emoji> Если что-то не скачивается — '
+        f'возможно, ссылка закрытая или сайт временно недоступен.</i>'
     )
     await message.answer(text, parse_mode=ParseMode.HTML,
                          reply_markup=InlineKeyboardMarkup(inline_keyboard=[
@@ -778,32 +780,89 @@ async def create_promo(message: Message, state: FSMContext):
 
 
 # ================= СКАЧИВАНИЕ =================
+
+# ✅ ФИКС: опции yt-dlp которые реально работают с YouTube и другими источниками
+def _base_ydl_opts() -> dict:
+    return {
+        'quiet': True,
+        'no_warnings': True,
+        'logger': SilentLogger(),
+        # Android client обходит большинство защит YouTube без cookies
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'skip': ['hls', 'dash'],
+            }
+        },
+        # Не падать если один из форматов недоступен
+        'ignoreerrors': False,
+        # User-Agent мобильного браузера
+        'http_headers': {
+            'User-Agent': (
+                'Mozilla/5.0 (Linux; Android 12; Pixel 6) '
+                'AppleWebKit/537.36 (KHTML, like Gecko) '
+                'Chrome/112.0.0.0 Mobile Safari/537.36'
+            )
+        },
+    }
+
+
 def extract_media_info_sync(url: str):
-    ydl_opts = {'quiet': True, 'logger': SilentLogger(), 'extract_flat': 'in_playlist'}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+    """
+    ✅ ФИКС: убран extract_flat который ломал анализ обычных видео.
+    Теперь сначала пробуем получить полную информацию о видео.
+    """
+    opts = _base_ydl_opts()
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
-        except Exception:
+        except Exception as e:
+            print(f"[yt-dlp] Ошибка при анализе {url}: {e}")
             return None
 
-        if info.get('_type') == 'playlist' or info.get('vcodec') == 'none':
-            return {"type": "photo", "url": url, "thumb": info.get('thumbnail')}
+    if info is None:
+        return None
 
-        formats    = info.get('formats', [])
-        unique_res = {}
-        for f in formats:
-            if f.get('vcodec') != 'none' and f.get('height'):
-                unique_res[f['height']] = f['format_id']
+    # Плейлист — берём первый элемент
+    if info.get('_type') == 'playlist':
+        entries = info.get('entries') or []
+        if not entries:
+            return None
+        info = entries[0]
+        if info is None:
+            return None
 
-        if not unique_res:
-            return {"type": "photo", "url": url, "thumb": info.get('thumbnail')}
+    # Если это аудио-контент (нет видеодорожки) — отдаём как фото/медиа
+    if info.get('vcodec') == 'none' and not info.get('formats'):
+        return {"type": "photo", "url": url, "thumb": info.get('thumbnail')}
 
-        return {
-            "type":    "video",
-            "thumb":   info.get('thumbnail'),
-            "title":   info.get('title', 'Видео'),
-            "formats": {str(h): unique_res[h] for h in sorted(unique_res.keys(), reverse=True)}
-        }
+    formats = info.get('formats') or []
+
+    # Собираем уникальные разрешения с видео-дорожкой
+    unique_res = {}
+    for f in formats:
+        height = f.get('height')
+        vcodec = f.get('vcodec', 'none')
+        if vcodec and vcodec != 'none' and height and height > 0:
+            # Берём формат с наибольшим битрейтом для каждого разрешения
+            if height not in unique_res:
+                unique_res[height] = f['format_id']
+            else:
+                existing = next((x for x in formats if x['format_id'] == unique_res[height]), None)
+                if existing and (f.get('tbr') or 0) > (existing.get('tbr') or 0):
+                    unique_res[height] = f['format_id']
+
+    if not unique_res:
+        # Форматов нет — пробуем скачать как есть (фото / gif / etc)
+        return {"type": "photo", "url": url, "thumb": info.get('thumbnail')}
+
+    return {
+        "type":    "video",
+        "thumb":   info.get('thumbnail'),
+        "title":   info.get('title', 'Видео'),
+        "formats": {str(h): unique_res[h] for h in sorted(unique_res.keys(), reverse=True)}
+    }
 
 
 @router.message(F.text.regexp(r'https?://'))
@@ -884,22 +943,30 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
 
     def dl_sync():
         filename = f"{DOWNLOADS_DIR}/vid_{int(time.time())}.mp4"
-        ydl_opts = {
+        opts = _base_ydl_opts()
+        opts.update({
             'outtmpl':             filename,
-            'format':              f"{format_id}+bestaudio/best" if format_id != "best" else "best",
+            'format':              f"{format_id}+bestaudio/best" if format_id != "best" else "bestvideo+bestaudio/best",
             'merge_output_format': 'mp4',
-            'quiet':               True,
-            'logger':              SilentLogger(),
-            'progress_hooks':      [get_progress_hook(task_id)]
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            'progress_hooks':      [get_progress_hook(task_id)],
+        })
+        with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
+        # Ищем реальный путь — yt-dlp иногда меняет расширение
+        if not os.path.exists(filename):
+            base = filename.replace('.mp4', '')
+            for ext in ('.mp4', '.mkv', '.webm', '.mov'):
+                if os.path.exists(base + ext):
+                    return base + ext
         return filename
 
     try:
         file_path = await asyncio.to_thread(dl_sync)
 
-        # Водяной знак (если включён в настройках)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Файл не найден после скачивания: {file_path}")
+
+        # Водяной знак (если включён)
         if await is_watermark_enabled():
             try:
                 await status_msg.edit_caption(
@@ -909,11 +976,12 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
                 pass
             file_path = await asyncio.to_thread(add_watermark_sync, file_path)
 
-        # Переключаем прогресс на фазу отправки
+        # Переключаемся на фазу отправки
         progress_data[task_id] = {'percent': '0%', 'speed': '—', 'eta': '...', 'phase': 'upload'}
         file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
 
         if file_size_mb < 50:
+            # Маленькие файлы — через aiogram (таймаут уже увеличен при создании Bot)
             try:
                 await status_msg.edit_caption(
                     caption=f'<b><tg-emoji emoji-id="5963103826075456248">⬆️</tg-emoji> Отправляю файл...</b>',
@@ -921,8 +989,10 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
             except Exception:
                 pass
             await status_msg.answer_video(FSInputFile(file_path))
+
         else:
-            # Большие файлы — через Pyrogram с прогрессом загрузки
+            # ✅ ФИКС: большие файлы через Pyrogram с таймаутом 10 минут
+            # Если зависнет — asyncio.wait_for поднимет TimeoutError
             start_time  = time.time()
             last_update = {'t': 0}
 
@@ -942,19 +1012,34 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
                     'phase':   'upload'
                 }
 
-            # ФИКС: используем pyro_app напрямую, без "async with"
-            await pyro_app.send_video(chat_id=user_id, video=file_path, progress=upload_progress)
+            await asyncio.wait_for(
+                pyro_app.send_video(chat_id=user_id, video=file_path, progress=upload_progress),
+                timeout=600  # 10 минут максимум
+            )
 
+        # Всё ок — убираем прогресс и удаляем статусное сообщение
         progress_data.pop(task_id, None)
         updater_task.cancel()
-
         await status_msg.delete()
+
         if not await is_premium(user_id):
             await increment_download(user_id)
 
-    except Exception:
+    except asyncio.TimeoutError:
         progress_data.pop(task_id, None)
         updater_task.cancel()
+        try:
+            await status_msg.edit_text(
+                f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Превышено время отправки.</b>\n'
+                f'<i>Файл слишком большой или соединение нестабильное. Попробуй ещё раз.</i>',
+                parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    except Exception as e:
+        progress_data.pop(task_id, None)
+        updater_task.cancel()
+        print(f"[download_and_send_media] Ошибка: {e}")
         try:
             await status_msg.edit_text(
                 f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Ошибка при скачивании.</b>\n'
@@ -962,6 +1047,7 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
                 parse_mode=ParseMode.HTML)
         except Exception:
             pass
+
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
@@ -989,11 +1075,8 @@ async def download_quality(callback: CallbackQuery, state: FSMContext):
 async def main():
     await init_db()
     dp.include_router(router)
-
-    # ФИКС: Pyrogram запускается один раз и живёт всё время работы бота
     await pyro_app.start()
     print(f"Бот {BOT_USERNAME} запущен!")
-
     try:
         await dp.start_polling(bot)
     finally:
