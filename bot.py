@@ -16,7 +16,7 @@ from aiohttp import ClientTimeout
 from pyrogram import Client
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "8780332671:AAEjIKe6pTaN0ACiO_dKorCqJqaJdB30uuc"
+BOT_TOKEN = "8780332671:AAGFRCXcjHiO79egzeY7Jfjkt0y2HLTqi6c"
 API_ID = 33120499
 API_HASH = "98835783a52a878e271c0c7acbc24876"
 
