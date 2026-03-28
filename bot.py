@@ -1,22 +1,22 @@
-import asyncio
-import os
-import time
-import subprocess
-import yt_dlp
-import aiosqlite
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (Message, CallbackQuery, InlineKeyboardMarkup,
-                           InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, FSInputFile)
-from aiogram.types.reaction_type_emoji import ReactionTypeEmoji
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
-from aiogram.enums import ParseMode
-from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout
-from pyrogram import Client
+импорт асинкио
+импорт ос
+импорт время
+импорт подпроцесс
+импорт yt_dlp
+импорт aiosqlite
+от айограмма импорт Бот, Диспетчер, Маршрутизатор, F
+от айограмма.типы импорт (Сообщение, CallbackQuery, InlineKeyboardMarkup,
+ InlineKeyboardButton, LabeledPrice, PreCheckoutQuery, FSInputFile)
+от айограммы.типы.тип_реакции_эмодзи импорт Тип реакцииЭмодзи
+от айограммы.фсм.контекст импорт ФСМКонтекст
+от айограммы.фсм.состояние импорт Группа государств, государство
+от айограммы.перечисления импорт ParseMode
+от айограмма.клиент.сессия.айоhttp импорт AiohttpSession
+от ayohttp импорт ClientTimeout
+от пирограмма импорт Клиент
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "8780332671:AAEjIKe6pTaN0ACiO_dKorCqJqaJdB30uuc"
+BOT_TOKEN = "8780332671:AAGFRCXcjHiO79egzeY7Jfjkt0y2HLTqi6c"
 API_ID = 33120499
 API_HASH = "98835783a52a878e271c0c7acbc24876"
 
@@ -24,53 +24,53 @@ ADMIN_GROUP_ID = -1003152594582
 MAIN_ADMIN_ID = 7720599904
 
 DB_PATH = "bot_database.db"
-DOWNLOADS_DIR = "downloads"
-BOT_USERNAME = "@VidLoads_Bot"
+КАТАЛОГ_ЗАГРУЗОК = "загрузки"
+ИМЯ_БОТА = "@VidLoads_Bot"
 
-PRICES_STARS = {
+ЦЕНЫ_ЗВЕЗДЫ = {
     7: 50,
     30: 150,
     60: 250,
     365: 1000
 }
 
-if not os.path.exists(DOWNLOADS_DIR):
-    os.makedirs(DOWNLOADS_DIR)
+если нет ос.путь.существует(КАТАЛОГ_ЗАГРУЗОК):
+ ос.македиры(КАТАЛОГ_ЗАГРУЗОК)
 
-# ✅ Увеличенный таймаут для aiogram — чтобы не падал при отправке больших файлов
-_session = AiohttpSession(timeout=ClientTimeout(total=3600))
-bot = Bot(token=BOT_TOKEN, session=_session)
-dp = Dispatcher()
-router = Router()
+# ✅ Увеличенный таймаут для айограмма — чтобы не падал при отправке больших файлов
+_сессия = AiohttpSession(тайм-аут=ClientTimeout(всего=3600))
+бот = Бот(токен=BOT_TOKEN, сессия=_сессия)
+дп = Диспетчер()
+маршрутизатор = Маршрутизатор()
 
-# ✅ Pyrogram запускается один раз в main()
-pyro_app = Client("pyro_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ✅ Пирограамма запоскаэтся один рз в main()
+pyro_app = Клиент("пиро_сессия", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 
 # ================= FSM СТЕЙТЫ =================
-class PaymentState(StatesGroup):
-    waiting_for_receipt = State()
-    waiting_for_promo = State()
+класс СостояниеОплаты(Группа государств):
+ ожидание_получения_квитанции = Состояние()
+ ожидание_промо = Состояние()
 
 
-class AdminStates(StatesGroup):
-    waiting_for_broadcast = State()
-    waiting_for_limit = State()
-    waiting_for_promo_data = State()
+класс AdminStates(Группа государств):
+ ожидание_трансляции_ = Состояние()
+ ожидание_лимита_ = Состояние()
+ ожидание_промо_данных = Состояние()
 
 
-class DownloadState(StatesGroup):
-    waiting_for_quality = State()
+класс DownloadState(Группа государств):
+ ожидание_качества = Состояние()
 
 
 # ================= ГЛОБАЛЬНЫЙ ПРОГРЕСС =================
-progress_data = {}
+данные_прогресса = {}
 
 
-class SilentLogger:
-    def debug(self, msg): pass
-    def warning(self, msg): pass
-    def error(self, msg): pass
+красс SilentLogger:
+    деф отлаживать(я, сообщение): проходить
+ деф предупреждение(я, сообщение): проходить
+ деф ошибка(я, сообщение): проходить
 
 
 def get_progress_hook(msg_id: int):
@@ -1005,83 +1005,83 @@ async def download_and_send_media(url: str, user_id: int, status_msg: Message, f
                 pct      = current * 100 / total
                 speed_mb = (current / elapsed) / (1024 * 1024)
                 eta_s    = int((total - current) / max(current / elapsed, 1))
-                progress_data[task_id] = {
-                    'percent': f'{pct:.1f}%',
-                    'speed':   f'{speed_mb:.1f} MB/s',
-                    'eta':     f'{eta_s}s',
-                    'phase':   'upload'
+ данные_прогресса[идентификатор_задачи] = {
+                    'процент': ф'{пкт:. .1ф}%',
+                    «скорость»:   ф'{скорость_мб:. .1ф} МБ/с',
+                    'эта': ф'{эта_с}с',
+ «фаза»: 'загрузить'
                 }
 
-            await asyncio.wait_for(
-                pyro_app.send_video(chat_id=user_id, video=file_path, progress=upload_progress),
-                timeout=600  # 10 минут максимум
+ ждать асинсио.ждать_для(
+ пиро_приложение.отправить_видео(chat_id=user_id, video=file_path, progress=upload_progress),
+ тайм-аут=600  # 10 минут максимум
             )
 
         # Всё ок — убираем прогресс и удаляем статусное сообщение
-        progress_data.pop(task_id, None)
-        updater_task.cancel()
-        await status_msg.delete()
+ данные_прогресса.поп(идентификатор_задачи, Нет)
+ updater_task.отменить()
+ ждать сообщение_статуса.удалить()
 
-        if not await is_premium(user_id):
-            await increment_download(user_id)
+ если нет ждать is_premium(идентификатор_пользователя):
+импорт осинкремент_скачать(идентификатор_пользователя)
 
-    except asyncio.TimeoutError:
-        progress_data.pop(task_id, None)
-        updater_task.cancel()
-        try:
-            await status_msg.edit_text(
-                f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Превышено время отправки.</b>\n'
-                f'<i>Файл слишком большой или соединение нестабильное. Попробуй ещё раз.</i>',
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+ кроме асинсио.TimeoutError:
+ данные_прогресса.поп(идентификатор_задачи, Нет)
+ updater_task.отменить()
+ пытаться:
+ ждать сообщение_статуса.редактировать_текст(
+                f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Перевишено врамена отправки.</b>\n'
+                f'<i>Файл слишком большой или соединение нѵсстЂЂЂабильное. Попрообуѹ ѵщё раз.</i>',
+ parse_mode=Режим анализа.HTML)
+ кроме Исключение:
+ проходить
 
-    except Exception as e:
-        progress_data.pop(task_id, None)
-        updater_task.cancel()
-        print(f"[download_and_send_media] Ошибка: {e}")
-        try:
-            await status_msg.edit_text(
-                f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Ошибка при скачивании.</b>\n'
-                f'<i>Попробуй ещё раз или выбери другое качество.</i>',
-                parse_mode=ParseMode.HTML)
-        except Exception:
-            pass
+ кроме Исключение как е:
+ данные_прогресса.поп(идентификатор_задачи, Нет)
+ updater_task.отменить()
+ печать(ф"[скачатьь_и_отправлять_меедиа] Шибка: {e}")
+ пытаться:
+ ждать сообщение_статуса.редактировать_текст(
+                f'<b><tg-emoji emoji-id="5870657884844462243">❌</tg-emoji> Шибка при скачивании.</b>\n'
+                f'<i>Попробуй ещё раз или выбѵри другѾѵ каѰчѵсство.</i>',
+ parse_mode=Режим анализа.HTML)
+ кроме Исключение:
+ проходить
 
-    finally:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
+ окончательно:
+ если путь_файла и ос.путь.существует(путь_файла):
+ ос.удалять(путь_файла)
 
 
-@router.callback_query(DownloadState.waiting_for_quality, F.data.startswith("dl_quality_"))
-async def download_quality(callback: CallbackQuery, state: FSMContext):
-    selected     = callback.data.split("_")[2]
-    data         = await state.get_data()
-    formats_dict = data.get("formats", {})
+@маршрутизатор.обратный вызов_запрос(ЗагрузитьСостояние.ожидание_качества, Ф.данные.начинает с("dl_quality_"))
+асинхронный деф качество_загрузки(Открытый вход: CallbackQuery, сообщение: FSMContext):
+ выбрано = обратный вызов.данные.расколоть("_")[2]
+ данные = ждать состояние.получить_данные()
+ formats_dict = данные.получать("форматы", {})
 
-    prem            = await is_premium(callback.from_user.id)
-    heights         = list(formats_dict.keys())
-    premium_heights = heights[:2] if len(heights) > 2 else []
+ прем = ждать is_premium(обратный вызов.от_пользователя.идентификатор)
+ высоты = список(formats_dict.ключи())
+ премиум_высоты = цены[:2] если лен(высоты) > 2 еще []
 
-    if selected in premium_heights and not prem:
-        return await callback.answer("Это качество доступно только с Premium!", show_alert=True)
+ если выбрано в премиум_высоты и нет прем:
+ возвращаться ждать обратный вызов.отвечать(«Это качество доступно толко с Премиум!», показать_оповещение=Истинный)
 
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await download_and_send_media(data["url"], callback.from_user.id, callback.message, formats_dict[selected])
-    await state.clear()
+ ждать обратный вызов.сообщение.редактировать_разметку_ответа(ответ_разметка=Нет)
+ ждать скачать_и_отправить_медиа(данные["url"], обратный вызов.от_пользователя.идентификатор, обратный вызов.сообщение, format_dict[выбрано])
+ ждать состояние.прозрачный()
 
 
 # ================= ЗАПУСК =================
-async def main():
-    await init_db()
-    dp.include_router(router)
-    await pyro_app.start()
-    print(f"Бот {BOT_USERNAME} запущен!")
-    try:
-        await dp.start_polling(bot)
-    finally:
-        await pyro_app.stop()
+асинхронный деф основной():
+ ждать init_db()
+ дп.включить_маршрутизатор(маршрутизатор)
+ ждать пиро_приложение.начинать()
+    печать(ф"Бот {ИМЯ_ПОЛЬЗОВАТЕЛЯ БОТА} запущен!")
+ пытаться:
+ ждать дп.старт_опроса(бот)
+ окончательно:
+ ждать пиро_приложение.останавливаться()
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+если __имя__ == "__основной__":
+ асинсио.бегать(основной())
