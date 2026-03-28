@@ -12,7 +12,6 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.enums import ParseMode
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiohttp import ClientTimeout
 from pyrogram import Client
 
 # ================= НАСТРОЙКИ =================
@@ -37,14 +36,14 @@ PRICES_STARS = {
 if not os.path.exists(DOWNLOADS_DIR):
     os.makedirs(DOWNLOADS_DIR)
 
-# ✅ Увеличенный таймаут для aiogram — чтобы не падал при отправке больших файлов
-_session = AiohttpSession(timeout=ClientTimeout(total=3600))
+# ✅ ФИКС: timeout — просто число секунд, не ClientTimeout объект
+_session = AiohttpSession(timeout=3600)
 bot = Bot(token=BOT_TOKEN, session=_session)
 dp = Dispatcher()
 router = Router()
 
-# ✅ Pyrogram запускается один раз в main()
-pyro_app = Client("pyro_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ✅ ФИКС: pyro_app создаётся внутри main() чтобы использовать тот же event loop
+pyro_app: Client = None
 
 
 # ================= FSM СТЕЙТЫ =================
@@ -1073,8 +1072,13 @@ async def download_quality(callback: CallbackQuery, state: FSMContext):
 
 # ================= ЗАПУСК =================
 async def main():
+    global pyro_app
     await init_db()
     dp.include_router(router)
+
+    # ✅ ФИКС: Client создаётся ВНУТРИ main() — тогда он привязывается
+    # к тому же event loop что и aiogram, и не будет конфликта "different loop"
+    pyro_app = Client("pyro_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
     await pyro_app.start()
     print(f"Бот {BOT_USERNAME} запущен!")
     try:
