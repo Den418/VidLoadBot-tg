@@ -1,6 +1,7 @@
 import asyncio
 import os
 import re
+import sys
 import time
 import zipfile
 import shutil
@@ -70,6 +71,11 @@ pyro_upload_semaphore: asyncio.Semaphore = None
 # ThreadPoolExecutor с ограниченными воркерами
 _thread_pool = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+# Активные загрузки: user_id → subprocess.Process (для кнопки Отменить)
+active_procs: dict[int, asyncio.subprocess.Process] = {}
+# Активные задачи: user_id → asyncio.Task
+active_tasks: dict[int, asyncio.Task] = {}
+
 
 # ================= ПРЕМИУМ ЭМОДЗИ =================
 # Используйте E("id") в текстах сообщений
@@ -112,6 +118,18 @@ E_SENDMONEY = E("5890848474563352982", "🪙")
 E_MONEY     = E("5879814368572478751", "🏧")
 E_RELOAD    = E("5345906554510012647", "🔄")
 E_BACK      = "◁"  # для кнопок назад
+
+
+# ================= КНОПКА ОТМЕНЫ =================
+def cancel_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура с кнопкой Отменить для статус-сообщений."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="Отменить",
+            callback_data=f"cancel_dl_{user_id}",
+            icon_custom_emoji_id="5870657884844462243"
+        )
+    ]])
 
 
 # ================= FSM СТЕЙТЫ =================
@@ -164,8 +182,9 @@ def build_bar(percent_str: str, width: int = 12) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
-async def update_progress_message(msg: Message, task_id: int):
+async def update_progress_message(msg: Message, task_id: int, user_id: int = 0):
     last_text = ""
+    kb = cancel_kb(user_id) if user_id else None
     while task_id in progress_data:
         d     = progress_data.get(task_id, {})
         phase = d.get('phase', 'download')
@@ -191,11 +210,11 @@ async def update_progress_message(msg: Message, task_id: int):
         )
         if text != last_text:
             try:
-                await msg.edit_text(text, parse_mode=ParseMode.HTML)
+                await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
                 last_text = text
             except Exception:
                 try:
-                    await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML)
+                    await msg.edit_caption(caption=text, parse_mode=ParseMode.HTML, reply_markup=kb)
                     last_text = text
                 except Exception:
                     pass
@@ -676,39 +695,30 @@ def _base_ydl_opts(url: str = "") -> dict:
     return opts
 
 
-# ================= PINTEREST SCRAPER =================
+# ================= PINTEREST SCRAPER (фото + видео) =================
 async def pinterest_get_image(url: str) -> str | None:
-    """
-    Вытаскивает прямую ссылку на оригинальное изображение с Pinterest.
-    Сначала пробует API, затем парсинг HTML.
-    """
+    """Возвращает прямую ссылку на оригинальное изображение Pinterest."""
     try:
-        # Метод 1 — Pinterest oEmbed
         api = f"https://www.pinterest.com/oembed/?url={url}"
-        headers = {'User-Agent': COMMON_UA}
         async with aiohttp.ClientSession() as s:
-            async with s.get(api, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as r:
+            async with s.get(api, headers={'User-Agent': COMMON_UA},
+                             timeout=aiohttp.ClientTimeout(total=15)) as r:
                 if r.status == 200:
                     data = await r.json(content_type=None)
                     thumb = data.get('thumbnail_url', '')
                     if thumb:
-                        # Заменяем 236x на originals для максимального разрешения
                         thumb = re.sub(r'/\d+x/', '/originals/', thumb)
                         return thumb
     except Exception as e:
         print(f"[Pinterest oEmbed] {e}")
 
     try:
-        # Метод 2 — парсинг HTML страницы
-        headers = {
-            'User-Agent': COMMON_UA,
-            'Accept-Language': 'en-US,en;q=0.9',
-        }
+        headers = {'User-Agent': COMMON_UA, 'Accept-Language': 'en-US,en;q=0.9'}
         async with aiohttp.ClientSession() as s:
-            async with s.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as r:
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
                 html = await r.text(errors='ignore')
 
-        # Ищем оригинальный URL изображения в мета-тегах
         patterns = [
             r'"url"\s*:\s*"(https://i\.pinimg\.com/originals/[^"]+)"',
             r'"url"\s*:\s*"(https://i\.pinimg\.com/\d+x/[^"]+)"',
@@ -719,7 +729,6 @@ async def pinterest_get_image(url: str) -> str | None:
             match = re.search(pattern, html)
             if match:
                 img_url = match.group(1)
-                # Пытаемся получить оригинал вместо превью
                 img_url = re.sub(r'/\d+x/', '/originals/', img_url)
                 return img_url
     except Exception as e:
@@ -728,104 +737,186 @@ async def pinterest_get_image(url: str) -> str | None:
     return None
 
 
-# ================= SPOTIFY / ЯНДЕКС МУЗЫКА =================
-async def get_music_info(url: str) -> dict | None:
+async def pinterest_get_video(url: str) -> str | None:
     """
-    Получает информацию о треке/плейлисте из Spotify или Яндекс Музыки
-    через yt-dlp (поддерживает Spotify через spotdl-обёртку и YM через yt-dlp).
+    Ищет прямую ссылку на видео в пине Pinterest.
+    Смотрит в JSON-данных страницы и <video> тегах.
     """
-    opts = _base_ydl_opts(url)
-    opts['extract_flat'] = True   # быстрый анализ без скачивания
+    try:
+        headers = {
+            'User-Agent': COMMON_UA,
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=25),
+                             allow_redirects=True) as r:
+                html = await r.text(errors='ignore')
 
+        video_patterns = [
+            # Прямые видео-URL в JSON Pinterest
+            r'"video_url"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
+            r'"url"\s*:\s*"(https://v(?:1|files)\.pinimg\.com/[^"]+\.mp4[^"]*)"',
+            r'"contentUrl"\s*:\s*"(https://[^"]+\.mp4[^"]*)"',
+            # <video> теги
+            r'<video[^>]+src=["\x27](https://[^"\x27]+\.mp4[^"\x27]*)["\x27]',
+            r'<source[^>]+src=["\x27](https://[^"\x27]+\.mp4[^"\x27]*)["\x27]',
+            # og:video
+            r'property="og:video(?::url)?"\s+content="([^"]+)"',
+            r'content="([^"]+)"\s+property="og:video(?::url)?"',
+        ]
+        for pattern in video_patterns:
+            m = re.search(pattern, html)
+            if m:
+                video_url = m.group(1).replace('\\/', '/').replace('\\u002F', '/')
+                if video_url.startswith('http'):
+                    return video_url
+    except Exception as ex:
+        print(f"[pinterest_get_video] {ex}")
+    return None
+
+
+# ================= SPOTIFY / ЯНДЕКС МУЗЫКА =================
+# Прогресс-паттерн yt-dlp CLI
+_DL_PROGRESS_RE = re.compile(
+    r'\[download\]\s+([\d.]+)%.*?at\s+([\d.]+\s*\S+/s).*?ETA\s+(\S+)',
+    re.IGNORECASE
+)
+
+
+def _get_music_info_sync(url: str) -> dict | None:
+    opts = _base_ydl_opts(url)
+    opts['extract_flat'] = True
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=False)
         if not info:
             return None
-
         if info.get('_type') == 'playlist':
             entries = [e for e in (info.get('entries') or []) if e]
-            return {
-                'type':    'playlist',
-                'title':   info.get('title', 'Плейлист'),
-                'count':   len(entries),
-                'entries': entries,
-            }
-        else:
-            return {
-                'type':     'track',
-                'title':    info.get('title', 'Трек'),
-                'artist':   info.get('artist') or info.get('uploader', ''),
-                'duration': info.get('duration'),
-                'thumb':    info.get('thumbnail'),
-            }
+            return {'type': 'playlist', 'title': info.get('title', 'Плейлист'), 'count': len(entries)}
+        return {
+            'type':     'track',
+            'title':    info.get('title', 'Трек'),
+            'artist':   info.get('artist') or info.get('uploader', ''),
+            'duration': info.get('duration'),
+            'thumb':    info.get('thumbnail'),
+        }
     except Exception as e:
-        print(f"[get_music_info] {e}")
+        print(f"[_get_music_info_sync] {e}")
         return None
-
-
-def download_music_track_sync(url: str, out_dir: str, task_id: int) -> list[str]:
-    """
-    Скачивает один трек или весь плейлист как MP3 в папку out_dir.
-    Возвращает список скачанных файлов.
-    """
-    opts = _base_ydl_opts(url)
-    opts.update({
-        'outtmpl':    os.path.join(out_dir, '%(playlist_index)s_%(title)s.%(ext)s'),
-        'format':     'bestaudio/best',
-        'ffmpeg_location': FFMPEG_PATH,
-        'postprocessors': [{
-            'key':              'FFmpegExtractAudio',
-            'preferredcodec':   'mp3',
-            'preferredquality': '320',
-        }, {
-            'key':              'FFmpegMetadata',   # теги ID3
-            'add_metadata':     True,
-        }],
-        'writethumbnail':  True,    # обложка альбома
-        'embedthumbnail':  True,    # встраиваем обложку в mp3
-        'progress_hooks':  [get_progress_hook(task_id)],
-        'noplaylist':      False,
-    })
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        ydl.download([url])
-
-    # Собираем скачанные mp3
-    files = []
-    for f in os.listdir(out_dir):
-        if f.endswith('.mp3'):
-            files.append(os.path.join(out_dir, f))
-    return sorted(files)
 
 
 async def send_music(
     url: str, user_id: int, status_msg: Message,
     platform: str, is_playlist: bool = False, playlist_title: str = ""
 ):
-    """Скачивает и отправляет музыку (трек или плейлист ZIP)."""
-    task_id   = status_msg.message_id
-    out_dir   = os.path.join(DOWNLOADS_DIR, f"music_{task_id}")
+    """
+    Скачивает музыку через subprocess:
+    - Spotify  → spotdl CLI
+    - Яндекс Музыка / YouTube / остальные → yt-dlp CLI (audio mode)
+    Не зависает — subprocess убивается при отмене или таймауте.
+    """
+    task_id = status_msg.message_id
+    out_dir = os.path.join(DOWNLOADS_DIR, f"music_{task_id}")
     os.makedirs(out_dir, exist_ok=True)
     progress_data[task_id] = {'percent': '0%', 'speed': '—', 'eta': '...', 'phase': 'download'}
-    updater   = asyncio.create_task(update_progress_message(status_msg, task_id))
+    updater = asyncio.create_task(update_progress_message(status_msg, task_id, user_id))
 
+    proc = None
     try:
-        files = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                _thread_pool,
-                download_music_track_sync, url, out_dir, task_id
-            ),
-            timeout=DOWNLOAD_TIMEOUT
+        if is_spotify(url):
+            # ── Spotify через spotdl ────────────────────────────────────────
+            await safe_edit(
+                status_msg,
+                f'{E_DOWNLOAD} <b>Скачиваю с Spotify...</b>\n'
+                f'<i>Используется spotdl — это может занять время.</i>',
+                ParseMode.HTML
+            )
+            cmd = [
+                sys.executable, '-m', 'spotdl',
+                '--ffmpeg', FFMPEG_PATH,
+                '--output', os.path.join(out_dir, '{title} - {artists}.{output-ext}'),
+                url,
+            ]
+        else:
+            # ── Яндекс Музыка / другие через yt-dlp ────────────────────────
+            await safe_edit(
+                status_msg,
+                f'{E_DOWNLOAD} <b>Скачиваю аудио...</b>',
+                ParseMode.HTML
+            )
+            out_tpl = os.path.join(out_dir, '%(playlist_index)s_%(title)s.%(ext)s')
+            hdrs = _base_ydl_opts(url).get('http_headers', {})
+            cmd = [
+                sys.executable, '-m', 'yt_dlp',
+                '--ffmpeg-location', FFMPEG_PATH,
+                '-o', out_tpl,
+                '--format', 'bestaudio/best',
+                '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0',
+                '--embed-thumbnail', '--add-metadata',
+                '--socket-timeout', '20',
+                '--retries', '5',
+                '--geo-bypass',
+                '--no-warnings',
+                '--newline',
+                '--yes-playlist',
+            ]
+            for k, v in hdrs.items():
+                cmd += ['--add-header', f'{k}:{v}']
+            cmd.append(url)
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        active_procs[user_id] = proc
+
+        # Парсим прогресс из stdout
+        async def _read():
+            async for raw in proc.stdout:
+                line = raw.decode('utf-8', errors='ignore').strip()
+                m = _DL_PROGRESS_RE.search(line)
+                if m:
+                    progress_data[task_id] = {
+                        'percent': f'{m.group(1)}%',
+                        'speed':   m.group(2),
+                        'eta':     m.group(3),
+                        'phase':   'download',
+                        'size_mb': 0,
+                    }
+
+        reader = asyncio.create_task(_read())
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=DOWNLOAD_TIMEOUT)
+        finally:
+            reader.cancel()
+
+        active_procs.pop(user_id, None)
+
+        if proc.returncode and proc.returncode != 0:
+            stderr = (await proc.stderr.read()).decode('utf-8', errors='ignore')
+            # Возможно, задача была отменена пользователем
+            if proc.returncode == -9:  # SIGKILL
+                return
+            raise RuntimeError(stderr[:400])
+
+        # Собираем скачанные файлы
+        files = sorted([
+            os.path.join(out_dir, f) for f in os.listdir(out_dir)
+            if f.lower().endswith(('.mp3', '.m4a', '.ogg', '.opus', '.flac'))
+        ])
 
         if not files:
-            raise RuntimeError("Треки не скачались")
+            raise RuntimeError("Треки не скачались — возможно, требуется авторизация или ссылка недоступна.")
 
         progress_data.pop(task_id, None)
         updater.cancel()
 
         if is_playlist and len(files) > 1:
-            # Упаковываем в ZIP
+            # ZIP архив
             await safe_edit(
                 status_msg,
                 f'{E_BOX} <b>Упаковываю {len(files)} треков в ZIP...</b>',
@@ -844,7 +935,6 @@ async def send_music(
                 f'{E_BOX} {len(files)} треков · {size_str}\n'
                 f'<i>Скачано через {BOT_USERNAME}</i>'
             )
-
             file_size_mb = os.path.getsize(zip_path) / 1024 / 1024
             if file_size_mb < 50:
                 await status_msg.answer_document(
@@ -855,22 +945,17 @@ async def send_music(
                 async with pyro_upload_semaphore:
                     await asyncio.wait_for(
                         pyro_app.send_document(
-                            chat_id=user_id,
-                            document=zip_path,
-                            caption=caption,
-                            file_name=f"{zip_name}.zip"
+                            chat_id=user_id, document=zip_path,
+                            caption=caption, file_name=f"{zip_name}.zip"
                         ),
                         timeout=UPLOAD_TIMEOUT
                     )
             os.remove(zip_path)
-
         else:
-            # Один трек — отправляем напрямую как аудио
+            # Один трек
             await safe_edit(status_msg, f'{E_UPLOAD} <b>Отправляю трек...</b>', ParseMode.HTML)
             for f in files:
-                name = os.path.splitext(os.path.basename(f))[0]
-                # Убираем порядковый номер из имени
-                name = re.sub(r'^\d+_', '', name)
+                name     = re.sub(r'^\d+_', '', os.path.splitext(os.path.basename(f))[0])
                 size_str = fmt_size(os.path.getsize(f))
                 caption  = (
                     f'{E_MEDIA} <b>{name}</b>\n'
@@ -887,22 +972,47 @@ async def send_music(
             await increment_download(user_id)
 
     except asyncio.TimeoutError:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
         progress_data.pop(task_id, None)
         updater.cancel()
         await safe_edit(
             status_msg,
             f'{E_CLOCK} <b>Время ожидания истекло</b>\n'
-            f'<i>Плейлист слишком большой. Попробуйте отдельный трек.</i>',
+            f'<i>Плейлист слишком большой. Попробуйте скачать один трек.</i>',
             ParseMode.HTML
         )
-    except Exception as e:
+    except asyncio.CancelledError:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
         progress_data.pop(task_id, None)
         updater.cancel()
-        print(f"[send_music] {e}")
+    except Exception as e:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
+        progress_data.pop(task_id, None)
+        updater.cancel()
+        err = str(e)
+        print(f"[send_music] {err}")
+        # Проверяем, не была ли это отмена пользователем
+        if 'cancel' in err.lower() or proc and proc.returncode == -9:
+            return
+        hint = ""
+        if is_spotify(url):
+            hint = (f'\n\n<i>Spotify: убедитесь что установлен spotdl '
+                    f'(<code>pip install spotdl</code>) и ссылка публичная.</i>')
+        elif is_yandex_music(url):
+            hint = '\n\n<i>Яндекс Музыка: некоторые треки доступны только авторизованным пользователям.</i>'
         await safe_edit(
             status_msg,
             f'{E_CROSS} <b>Не удалось скачать музыку</b>\n'
-            f'<i>Убедитесь, что ссылка публична и попробуйте снова.</i>',
+            f'<i>{err[:200]}</i>{hint}',
             ParseMode.HTML
         )
     finally:
@@ -1119,84 +1229,114 @@ async def _send_video_smart(file_path: str, user_id: int, status_msg: Message, c
             )
 
 
-# ================= ГЛАВНАЯ ФУНКЦИЯ СКАЧИВАНИЯ =================
+# ================= ГЛАВНАЯ ФУНКЦИЯ СКАЧИВАНИЯ (subprocess — не зависает) =================
 async def download_and_send_media(
     url: str, user_id: int, status_msg: Message,
     format_id: str = "best", audio_only: bool = False
 ):
-    """
-    Скачивает медиа с одной попыткой.
-    Зависание исключено: все I/O операции ограничены таймаутами.
-    Повторные вызовы делает сам handler при необходимости.
-    """
-    task_id   = status_msg.message_id
-    file_path = None
-    platform  = detect_platform(url)
+    task_id  = status_msg.message_id
+    platform = detect_platform(url)
+    ts       = int(time.time())
+    fid      = f"dl_{ts}_{user_id}"
+    out_tpl  = os.path.join(DOWNLOADS_DIR, f"{fid}.%(ext)s")
 
     progress_data[task_id] = {'percent': '0%', 'speed': '—', 'eta': '...', 'phase': 'download'}
-    updater = asyncio.create_task(update_progress_message(status_msg, task_id))
+    updater = asyncio.create_task(update_progress_message(status_msg, task_id, user_id))
 
-    def dl_sync():
-        ts   = int(time.time())
-        ext  = 'mp3' if audio_only else 'mp4'
-        base = f"{DOWNLOADS_DIR}/dl_{ts}"
-        opts = _base_ydl_opts(url)
-        opts.update({
-            'outtmpl':             f"{base}.%(ext)s",
-            'merge_output_format': 'mp4',
-            'progress_hooks':      [get_progress_hook(task_id)],
-        })
+    # Строим команду yt-dlp
+    hdrs = _base_ydl_opts(url).get('http_headers', {'User-Agent': COMMON_UA})
+    cmd  = [
+        sys.executable, '-m', 'yt_dlp',
+        '--ffmpeg-location', FFMPEG_PATH,
+        '-o', out_tpl,
+        '--socket-timeout', '20',
+        '--retries', '5',
+        '--fragment-retries', '5',
+        '--geo-bypass',
+        '--no-warnings',
+        '--newline',
+    ]
 
-        if audio_only:
-            opts['format'] = 'bestaudio/best'
-            opts['postprocessors'] = [{
-                'key':              'FFmpegExtractAudio',
-                'preferredcodec':   'mp3',
-                'preferredquality': '320',
-            }]
-        elif format_id == "best":
-            opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
-        else:
-            opts['format'] = f"{format_id}+bestaudio/bestvideo+bestaudio/best"
+    if audio_only:
+        cmd += [
+            '--format', 'bestaudio/best',
+            '--extract-audio', '--audio-format', 'mp3', '--audio-quality', '0',
+        ]
+    elif format_id == "best":
+        cmd += ['--format', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+                '--merge-output-format', 'mp4']
+    else:
+        cmd += ['--format', f'{format_id}+bestaudio/bestvideo+bestaudio/best',
+                '--merge-output-format', 'mp4']
 
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+    # YouTube: android клиент
+    if 'youtube.com' in url or 'youtu.be' in url:
+        cmd += ['--extractor-args', 'youtube:player_client=android,web']
 
-        # Ищем скачанный файл
-        for candidate_ext in ('.mp3', '.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4a', '.ogg'):
-            p = base + candidate_ext
-            if os.path.exists(p):
-                return p
-        # Fallback — поиск по timestamp
-        for f in sorted(os.listdir(DOWNLOADS_DIR)):
-            if str(ts) in f:
-                return os.path.join(DOWNLOADS_DIR, f)
-        return base + f'.{ext}'
+    for k, v in hdrs.items():
+        cmd += ['--add-header', f'{k}:{v}']
 
+    cmd.append(url)
+
+    proc      = None
+    file_path = None
     try:
-        # Запускаем скачивание в thread pool с жёстким таймаутом
-        future = _thread_pool.submit(dl_sync)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        active_procs[user_id] = proc
+
+        async def _read_stdout():
+            async for raw in proc.stdout:
+                line = raw.decode('utf-8', errors='ignore').strip()
+                m = _DL_PROGRESS_RE.search(line)
+                if m:
+                    progress_data[task_id] = {
+                        'percent': f'{m.group(1)}%',
+                        'speed':   m.group(2),
+                        'eta':     m.group(3),
+                        'phase':   'download',
+                        'size_mb': 0,
+                    }
+
+        reader = asyncio.create_task(_read_stdout())
         try:
-            file_path = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(None, future.result),
-                timeout=DOWNLOAD_TIMEOUT
-            )
-        except asyncio.TimeoutError:
-            future.cancel()
-            raise
+            await asyncio.wait_for(proc.wait(), timeout=DOWNLOAD_TIMEOUT)
+        finally:
+            reader.cancel()
+
+        active_procs.pop(user_id, None)
+
+        # Пользователь отменил (SIGKILL returncode)
+        if proc.returncode == -9:
+            progress_data.pop(task_id, None)
+            updater.cancel()
+            return
+
+        if proc.returncode and proc.returncode != 0:
+            stderr_out = (await proc.stderr.read()).decode('utf-8', errors='ignore')
+            raise RuntimeError(stderr_out[:500])
+
+        # Ищем скачанный файл по префиксу fid
+        file_path = None
+        for fn in sorted(os.listdir(DOWNLOADS_DIR), reverse=True):
+            if fn.startswith(fid):
+                file_path = os.path.join(DOWNLOADS_DIR, fn)
+                break
 
         if not file_path or not os.path.exists(file_path):
             raise FileNotFoundError("Файл не найден после скачивания")
 
         size_str = fmt_size(os.path.getsize(file_path))
 
-        # Водяной знак (только для видео)
+        # Водяной знак
         if not audio_only and await is_watermark_enabled():
             await safe_edit(status_msg, f'{E_PEN} <b>Добавляю водяной знак...</b>', ParseMode.HTML)
             progress_data[task_id] = {'percent': '50%', 'speed': '—', 'eta': '...', 'phase': 'convert'}
             file_path = await asyncio.to_thread(add_watermark_sync, file_path)
 
-        # Переходим к отправке
         progress_data[task_id] = {'percent': '0%', 'speed': '—', 'eta': '...', 'phase': 'upload'}
         await safe_edit(
             status_msg,
@@ -1222,9 +1362,9 @@ async def download_and_send_media(
 
         if not await is_premium(user_id):
             await increment_download(user_id)
-        remaining = await get_remaining(user_id)
         if not await is_premium(user_id):
-            limit = await get_daily_limit()
+            remaining = await get_remaining(user_id)
+            limit     = await get_daily_limit()
             try:
                 await bot.send_message(
                     user_id,
@@ -1235,6 +1375,10 @@ async def download_and_send_media(
                 pass
 
     except asyncio.TimeoutError:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
         progress_data.pop(task_id, None)
         updater.cancel()
         await safe_edit(
@@ -1245,7 +1389,19 @@ async def download_and_send_media(
             ParseMode.HTML
         )
 
+    except asyncio.CancelledError:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
+        progress_data.pop(task_id, None)
+        updater.cancel()
+
     except Exception as e:
+        if proc:
+            try: proc.kill()
+            except Exception: pass
+        active_procs.pop(user_id, None)
         progress_data.pop(task_id, None)
         updater.cancel()
         err = str(e).lower()
@@ -1254,7 +1410,7 @@ async def download_and_send_media(
         if 'private' in err:
             msg_text = f'{E_LOCK} <b>Видео приватное</b>\n<i>Доступ закрыт.</i>'
         elif 'not available' in err or 'unavailable' in err:
-            msg_text = f'{E_CROSS} <b>Видео недоступно</b>\n<i>Возможно, гео-блокировка или удалено.</i>'
+            msg_text = f'{E_CROSS} <b>Видео недоступно</b>\n<i>Гео-блокировка или удалено.</i>'
         elif '403' in err:
             msg_text = f'{E_LOCK} <b>Доступ запрещён (403)</b>\n<i>Сайт требует авторизацию.</i>'
         elif 'unsupported url' in err:
@@ -1264,16 +1420,127 @@ async def download_and_send_media(
                 f'{E_CROSS} <b>Ошибка при скачивании</b>\n\n'
                 f'<i>Попробуйте другое качество или повторите позже.</i>'
             )
-
-        await safe_edit(
-            status_msg,
-            msg_text,
-            ParseMode.HTML
-        )
+        await safe_edit(status_msg, msg_text, ParseMode.HTML)
 
     finally:
         if file_path and os.path.exists(file_path):
             os.remove(file_path)
+
+
+# ================= ОТМЕНА ЗАГРУЗКИ =================
+@router.callback_query(F.data.startswith("cancel_dl_"))
+async def cancel_download_cb(callback: CallbackQuery, state: FSMContext):
+    uid  = int(callback.data.split("_")[2])
+    # Убиваем subprocess если есть
+    proc = active_procs.get(uid)
+    if proc:
+        try: proc.kill()
+        except Exception: pass
+        active_procs.pop(uid, None)
+    # Отменяем asyncio task если есть
+    task = active_tasks.get(uid)
+    if task:
+        task.cancel()
+        active_tasks.pop(uid, None)
+    await state.clear()
+    await callback.answer("Загрузка отменена", show_alert=False)
+    try:
+        await callback.message.edit_text(
+            f'{E_CROSS} <b>Загрузка отменена.</b>',
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Главное меню", callback_data="back_to_main",
+                                     icon_custom_emoji_id="5893057118545646106")
+            ]])
+        )
+    except Exception:
+        pass
+
+
+# ================= YOUTUBE ПРЕВЬЮ =================
+async def youtube_get_thumbnail(video_id: str) -> tuple[str | None, str | None]:
+    """
+    Скачивает лучшее превью YouTube видео.
+    Возвращает (путь_к_файлу, качество) или (None, None).
+    """
+    qualities = [
+        ('maxres', f'https://img.youtube.com/vi/{video_id}/maxresdefault.jpg'),
+        ('hq',     f'https://img.youtube.com/vi/{video_id}/hqdefault.jpg'),
+        ('mq',     f'https://img.youtube.com/vi/{video_id}/mqdefault.jpg'),
+        ('sd',     f'https://img.youtube.com/vi/{video_id}/sddefault.jpg'),
+    ]
+    for quality, thumb_url in qualities:
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(thumb_url, headers={'User-Agent': COMMON_UA},
+                                 timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    if r.status == 200:
+                        data = await r.read()
+                        if len(data) > 500:  # не пустой файл
+                            path = os.path.join(DOWNLOADS_DIR, f"thumb_{int(time.time())}.jpg")
+                            with open(path, 'wb') as f:
+                                f.write(data)
+                            return path, quality
+        except Exception as e:
+            print(f"[yt_thumb {quality}] {e}")
+    return None, None
+
+
+def extract_youtube_video_id(url: str) -> str | None:
+    """Извлекает video ID из YouTube URL."""
+    patterns = [
+        r'(?:youtube\.com/watch\?v=|youtu\.be/|youtube\.com/embed/)([^&\n?#]+)',
+        r'youtube\.com/v/([^&\n?#]+)',
+        r'youtube\.com/watch\?.*v=([^&\n?#]+)',
+        r'youtube\.com/shorts/([^&\n?#]+)',
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+@router.callback_query(F.data.startswith("yt_thumb_"))
+async def youtube_thumb_handler(callback: CallbackQuery, state: FSMContext):
+    """Скачивает и отправляет превью YouTube видео."""
+    video_id = callback.data.replace("yt_thumb_", "")
+    uid      = callback.from_user.id
+
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await safe_edit(
+        callback.message,
+        f'{E_EYE} <b>Скачиваю превью...</b>',
+        ParseMode.HTML
+    )
+
+    path, quality = await youtube_get_thumbnail(video_id)
+    if path and os.path.exists(path):
+        size_str = fmt_size(os.path.getsize(path))
+        caption  = (
+            f'{E_MEDIA} <b>Превью YouTube</b>\n'
+            f'Качество: <b>{quality.upper()}</b> · {size_str}\n'
+            f'<i>Скачано через {BOT_USERNAME}</i>'
+        )
+        try:
+            await callback.message.answer_photo(
+                FSInputFile(path), caption=caption, parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            await callback.message.answer_document(
+                FSInputFile(path), caption=caption, parse_mode=ParseMode.HTML
+            )
+        os.remove(path)
+        await callback.message.delete()
+        if not await is_premium(uid):
+            await increment_download(uid)
+    else:
+        await safe_edit(
+            callback.message,
+            f'{E_CROSS} <b>Не удалось скачать превью.</b>',
+            ParseMode.HTML
+        )
+    await state.clear()
 
 
 # ================= БАЗОВЫЕ ХЭНДЛЕРЫ =================
@@ -2052,22 +2319,61 @@ async def process_link(message: Message, state: FSMContext):
             await safe_edit(msg, f'{E_CROSS} <b>Не удалось скачать изображение.</b>', ParseMode.HTML)
         return
 
-    # ── Pinterest (специальный scraper) ─────────────────────────────────────
+    # ── Pinterest (специальный scraper — фото И видео) ──────────────────────
     if 'pinterest.' in url or 'pin.it' in url:
         await safe_edit(msg, f'{E_EYE} <b>Получаю данные Pinterest...</b>', ParseMode.HTML)
+
+        # Сначала пробуем изображение
         img_url = await pinterest_get_image(url)
         if img_url:
             await safe_edit(msg, f'{E_DOWNLOAD} <b>Скачиваю изображение...</b>', ParseMode.HTML)
             file_path = await download_photo_direct(img_url)
             if file_path and os.path.exists(file_path):
-                caption = f'{E_MEDIA} Pinterest · {fmt_size(os.path.getsize(file_path))}\n<i>Скачано через {BOT_USERNAME}</i>'
+                caption = (f'{E_MEDIA} Pinterest · {fmt_size(os.path.getsize(file_path))}\n'
+                           f'<i>Скачано через {BOT_USERNAME}</i>')
                 await send_photo_smart(file_path, msg, caption)
                 os.remove(file_path)
                 await msg.delete()
                 if not await is_premium(uid):
                     await increment_download(uid)
                 return
-        # Если scraper не нашёл картинку — попробуем через yt-dlp (может быть видео)
+
+        # Если изображение не нашли — ищем видео прямым парсингом
+        await safe_edit(msg, f'{E_EYE} <b>Ищу видео в пине...</b>', ParseMode.HTML)
+        video_url = await pinterest_get_video(url)
+        if video_url:
+            await safe_edit(msg, f'{E_DOWNLOAD} <b>Скачиваю видео Pinterest...</b>', ParseMode.HTML)
+            vid_path = os.path.join(DOWNLOADS_DIR, f"pin_vid_{int(time.time())}.mp4")
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.get(
+                        video_url, headers={'User-Agent': COMMON_UA},
+                        timeout=aiohttp.ClientTimeout(total=120), allow_redirects=True
+                    ) as r:
+                        if r.status == 200:
+                            with open(vid_path, 'wb') as f:
+                                async for chunk in r.content.iter_chunked(256 * 1024):
+                                    f.write(chunk)
+                if os.path.exists(vid_path) and os.path.getsize(vid_path) > 1000:
+                    if await is_watermark_enabled():
+                        await safe_edit(msg, f'{E_PEN} <b>Добавляю водяной знак...</b>', ParseMode.HTML)
+                        vid_path = await asyncio.to_thread(add_watermark_sync, vid_path)
+                    await safe_edit(msg, f'{E_UPLOAD} <b>Отправляю...</b>', ParseMode.HTML)
+                    sz  = fmt_size(os.path.getsize(vid_path))
+                    cap = f'{E_MEDIA} Pinterest · {sz}\n<i>Скачано через {BOT_USERNAME}</i>'
+                    await _send_video_smart(vid_path, uid, msg, cap)
+                    await msg.delete()
+                    if not await is_premium(uid):
+                        await increment_download(uid)
+                    return
+            except Exception as ex:
+                print(f"[pinterest direct video] {ex}")
+            finally:
+                if os.path.exists(vid_path):
+                    os.remove(vid_path)
+
+        # Последний шанс — yt-dlp (может тоже извлечь видео-пин)
+        await safe_edit(msg, f'{E_RELOAD} <b>Пробую через универсальный загрузчик...</b>', ParseMode.HTML)
 
     # ── TikTok ──────────────────────────────────────────────────────────────
     if is_tiktok(url):
@@ -2154,6 +2460,17 @@ async def process_link(message: Message, state: FSMContext):
         callback_data="dl_audio",
         icon_custom_emoji_id="5870528606328852614"
     )])
+
+    # Кнопка превью для YouTube
+    if 'youtube.com' in url or 'youtu.be' in url:
+        yt_vid_id = extract_youtube_video_id(url)
+        if yt_vid_id:
+            rows.append([InlineKeyboardButton(
+                text="Превью (JPG)",
+                callback_data=f"yt_thumb_{yt_vid_id}",
+                icon_custom_emoji_id="6035128606563241721"
+            )])
+
     rows.append([InlineKeyboardButton(
         text="Отмена",
         callback_data="back_to_main",
